@@ -86,7 +86,7 @@ Tauri 提供桌面界面和进程管理，Go 后端提供 OpenAI 兼容代理、
 - macOS：`.dmg`
 - Linux：`.AppImage`、`.deb` 或 `.rpm`
 
-macOS 和 Windows 的公开构建默认不包含商业代码签名证书。系统可能在首次启动时显示安全提示。
+从 v1.1.5 起，正式 Release 中的 macOS DMG 和内含应用使用 Developer ID Application 签名。Apple 公证状态请查看对应 Release 说明；签名本身不代表已公证。Windows 构建暂未代码签名，系统可能在首次启动时显示安全提示。
 
 绿色版不需要安装，也不会写入程序目录以外的安装信息，但未签名的可执行文件仍可能触发 Windows SmartScreen。下载后可使用 Release 中的 `.sha256` 文件校验完整性。
 
@@ -179,12 +179,21 @@ MKRouter 默认仅监听 `127.0.0.1`。开启「局域网访问」后，请务�
 
 ## 自动构建
 
-GitHub Actions 会在推送、Pull Request 和手动触发时构建 Windows、macOS 与 Linux 安装包。推送形如 `v1.0` 的版本标签时，会自动创建 GitHub Release 并上传所有安装包。
+GitHub Actions 会在推送、Pull Request 和手动触发时构建 Windows、macOS 与 Linux 安装包。推送形如 `v1.0` 的版本标签时，会自动创建草稿 GitHub Release 并上传所有安装包。macOS 安装包需完成本地签名、替换草稿中的附件后再发布。
 
 ```bash
 git tag v1.0
 git push origin v1.0
 ```
+
+在已安装 Developer ID 签名身份的 Mac 上，对下载的 macOS 构建签名：
+
+```bash
+APPLE_SIGNING_IDENTITY="Developer ID Application: Your Company (TEAM_ID)" \
+  bash scripts/sign-macos-dmg.sh unsigned/MKRouter_1.1.5_aarch64.dmg dist/MKRouter_1.1.5_aarch64.dmg
+```
+
+脚本会依次签名后端、应用和 DMG，并生成 `.sha256` 文件。Intel DMG 也需执行一次。Apple 公证需另行配置公证凭据后进行。
 
 ## License
 

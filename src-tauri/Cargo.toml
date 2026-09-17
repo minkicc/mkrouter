@@ -1,6 +1,6 @@
 [package]
 name = "mkrouter-desktop"
-version = "1.1.4"
+version = "1.1.5"
 description = "A smart local AI gateway for cost-aware, reliability-first multi-channel routing"
 authors = ["MKRouter contributors"]
 license = "MIT"

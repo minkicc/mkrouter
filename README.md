@@ -86,7 +86,7 @@ Download the package for your platform from [GitHub Releases](https://github.com
 - macOS: `.dmg`
 - Linux: `.AppImage`, `.deb`, or `.rpm`
 
-Public macOS and Windows builds are not commercially code-signed by default. Your operating system may display a security warning the first time you launch the application.
+Starting with v1.1.5, macOS DMGs and their bundled applications in published Releases are signed with Developer ID Application. Check the release notes for Apple notarization status; signing alone does not imply notarization. Windows builds remain unsigned and may display a security warning on first launch.
 
 The Windows portable edition does not require installation, but unsigned executables may still trigger Microsoft Defender SmartScreen. Verify the download with the `.sha256` file included in the release.
 
@@ -180,12 +180,21 @@ MKRouter listens on `127.0.0.1` by default. When LAN access is enabled, keep tok
 
 ## Automated Builds
 
-GitHub Actions builds Windows, macOS, and Linux packages on pushes, pull requests, and manual runs. Pushing a version tag such as `v1.0` creates a GitHub Release and uploads all generated packages automatically.
+GitHub Actions builds Windows, macOS, and Linux packages on pushes, pull requests, and manual runs. Pushing a version tag such as `v1.0` creates a draft GitHub Release and uploads all generated packages automatically. Sign the macOS packages locally and replace the draft assets before publishing.
 
 ```bash
 git tag v1.0
 git push origin v1.0
 ```
+
+To sign a downloaded macOS build on a Mac with a Developer ID identity:
+
+```bash
+APPLE_SIGNING_IDENTITY="Developer ID Application: Your Company (TEAM_ID)" \
+  bash scripts/sign-macos-dmg.sh unsigned/MKRouter_1.1.5_aarch64.dmg dist/MKRouter_1.1.5_aarch64.dmg
+```
+
+The script signs the backend, app, and DMG and writes a `.sha256` file. Repeat for the Intel DMG. Notarization is a separate step requiring Apple notarization credentials.
 
 ## License
 
