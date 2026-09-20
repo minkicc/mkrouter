@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -140,8 +141,13 @@ func TestForwardCodexJSONChannelUsesChatGPTResponsesHeaders(t *testing.T) {
 	if got := captured.Header.Get("Originator"); got != "codex_cli_rs" {
 		t.Fatalf("originator = %q", got)
 	}
-	if got := captured.Header.Get("Version"); got != "0.200.0" {
+	// The advertised Codex version must come from the shared resolver, not from
+	// whatever version the client happened to send.
+	if got := captured.Header.Get("Version"); got != config.CodexClientVersionFallback {
 		t.Fatalf("version = %q", got)
+	}
+	if got := captured.Header.Get("User-Agent"); got != "codex_cli_rs/"+config.CodexClientVersionFallback+" (Windows 11; x86_64)" {
+		t.Fatalf("user agent = %q", got)
 	}
 }
 
@@ -918,6 +924,70 @@ func TestCodexOAuthStartReturnsPKCESession(t *testing.T) {
 	if !ok || !sessionOK || session.State != payload.State || session.CodeVerifier == "" {
 		t.Fatalf("stored oauth session = %#v", value)
 	}
+}
+
+func TestFetchUpstreamModelsUsesCodexAccountManifest(t *testing.T) {
+	accessToken := testServerCodexJWT(t, map[string]any{
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"client_id": config.CodexClientID,
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "account-from-token",
+		},
+	})
+	eng, err := engine.New(config.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.ProxyClient().Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != config.CodexModelsURL+"?client_version="+config.CodexClientVersionFallback {
+			t.Fatalf("target = %s", req.URL)
+		}
+		if req.Header.Get("Authorization") != "Bearer "+accessToken {
+			t.Fatalf("authorization = %q", req.Header.Get("Authorization"))
+		}
+		if req.Header.Get("ChatGPT-Account-ID") != "account-from-token" {
+			t.Fatalf("account id = %q", req.Header.Get("ChatGPT-Account-ID"))
+		}
+		if req.Header.Get("User-Agent") != "codex_cli_rs/"+config.CodexClientVersionFallback ||
+			req.Header.Get("Originator") != "codex_cli_rs" ||
+			req.Header.Get("Version") != config.CodexClientVersionFallback {
+			t.Fatalf("Codex model headers = %v", req.Header)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(bytes.NewBufferString(
+				`{"models":[{"slug":"gpt-5.6-sol"},{"slug":"gpt-5.5"},{"slug":"gpt-5.6-sol"}]}`,
+			)),
+		}, nil
+	})
+	srv := &Server{engine: eng}
+	models, err := srv.fetchUpstreamModels(config.Channel{
+		AuthType: config.ChannelAuthCodex,
+		CodexAuth: &config.CodexAuth{
+			AccessToken: accessToken,
+			AccountID:   "wrong@example.com",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 2 || models[0] != "gpt-5.5" || models[1] != "gpt-5.6-sol" {
+		t.Fatalf("models = %v", models)
+	}
+}
+
+func testServerCodexJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	header, err := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + "."
 }
 
 func TestRewriteRequestBody(t *testing.T) {

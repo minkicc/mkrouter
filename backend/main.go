@@ -59,7 +59,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("embed web ui: %v", err)
 	}
-	handler := server.New(eng, *cfgPath, uiFS, log.Default()).Handler()
+	srv := server.New(eng, *cfgPath, uiFS, log.Default())
+	srv.Start(ctx)
+	handler := srv.Handler()
 
 	bindAddr := cfg.ListenAddr
 	if cfg.AllowLAN {

@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,9 +38,22 @@ const (
 	codexOAuthRedirectURI  = "http://localhost:1455/auth/callback"
 	codexOAuthSessionTTL   = 30 * time.Minute
 	codexRefreshSkew       = 3 * time.Minute
-	codexDefaultVersion    = "0.146.0"
-	codexDefaultUA         = "codex-tui/" + codexDefaultVersion + " (Windows 11; x86_64) WindowsTerminal"
 )
+
+// codexDefaultVersion and codexDefaultUserAgent resolve the Codex client
+// version at call time so a synchronized release is picked up without a
+// restart, and so inference never advertises a different version than model
+// discovery.
+func (s *Server) codexDefaultVersion() string {
+	if s == nil || s.engine == nil {
+		return config.CodexClientVersionFallback
+	}
+	return s.engine.CodexClientVersion()
+}
+
+func (s *Server) codexDefaultUserAgent() string {
+	return "codex-tui/" + s.codexDefaultVersion() + " (Windows 11; x86_64) WindowsTerminal"
+}
 
 type Server struct {
 	engine             *engine.Engine
@@ -313,7 +327,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			attempts++
 			if !retryOnSameChannel(forwardErr) || attempts > maxRetries {
 				excluded[selection.Channel.ID] = true
-				s.engine.Cooldown(selection.Channel.ID)
+				reason := errorText(forwardErr)
+				if reason == "" {
+					reason = errorText(lastErr)
+				}
+				s.engine.CooldownWithReason(selection.Channel.ID, reason)
 				break
 			}
 		}
@@ -400,7 +418,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, selection *engi
 			return true, usageInfo{}, &retryDecisionError{err: authErr, same: false}
 		}
 		requestCodexAuth = auth
-		applyCodexRequestHeaders(req.Header, r.Header, auth, stream)
+		s.applyCodexRequestHeaders(req.Header, r.Header, auth, stream)
 	}
 	start := time.Now()
 	resp, err := s.engine.ProxyClient().Do(req)
@@ -466,8 +484,12 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, selection *engi
 			if n > 0 {
 				if !wrote {
 					if routing.ResponseFailed(captured.Bytes()) {
+						failure := errors.New("upstream response failed")
+						if detail := routing.ResponseFailureDetail(captured.Bytes()); detail != "" {
+							failure = fmt.Errorf("upstream response failed: %s", detail)
+						}
 						s.engine.RecordAttempt(ch.ID, resp.StatusCode, nil, time.Since(start))
-						return true, usageInfo{}, &retryDecisionError{err: errors.New("upstream response failed"), same: true}
+						return true, usageInfo{}, &retryDecisionError{err: failure, same: true}
 					}
 					w.WriteHeader(resp.StatusCode)
 				}
@@ -685,12 +707,14 @@ func (s *Server) persistConfig() {
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	cfg := s.engine.Config()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"listen_addr":     cfg.ListenAddr,
-		"allow_lan":       cfg.AllowLAN,
-		"lan_addrs":       lanAddrs(),
-		"channels":        s.engine.State(),
-		"model_mappings":  cfg.ModelMappings,
-		"fallback_models": cfg.FallbackModels,
+		"listen_addr":             cfg.ListenAddr,
+		"allow_lan":               cfg.AllowLAN,
+		"lan_addrs":               lanAddrs(),
+		"channels":                s.engine.State(),
+		"model_mappings":          cfg.ModelMappings,
+		"fallback_models":         cfg.FallbackModels,
+		"codex_client_version":    cfg.EffectiveCodexClientVersion(),
+		"codex_version_auto_sync": cfg.CodexVersionAutoSyncEnabled(),
 	})
 }
 
@@ -789,6 +813,14 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	current := s.engine.Config()
 	cfg.Tokens = current.Tokens
 	cfg.AuthToken = current.AuthToken
+	// The desktop UI does not edit the Codex client version, so a config save
+	// must not drop the synchronized release back to the compiled fallback.
+	if strings.TrimSpace(cfg.CodexClientVersionSynced) == "" {
+		cfg.CodexClientVersionSynced = current.CodexClientVersionSynced
+	}
+	if cfg.CodexVersionAutoSync == nil {
+		cfg.CodexVersionAutoSync = current.CodexVersionAutoSync
+	}
 	preserveNewerCodexAuthorizations(&cfg, current)
 	if err := s.engine.ReplaceConfig(&cfg); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -1103,6 +1135,7 @@ func (s *Server) handleDeleteToken(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleProbeModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		ChannelID       string `json:"channel_id"`
 		BaseURL         string `json:"base_url"`
 		AuthType        string `json:"auth_type"`
 		APIKey          string `json:"api_key"`
@@ -1113,6 +1146,35 @@ func (s *Server) handleProbeModels(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	req.ChannelID = strings.TrimSpace(req.ChannelID)
+	if req.ChannelID != "" {
+		cfg := s.engine.Config()
+		for i := range cfg.Channels {
+			if cfg.Channels[i].ID != req.ChannelID {
+				continue
+			}
+			channel := cfg.Channels[i]
+			if !channel.IsCodexAuth() {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "channel is not a Codex channel"})
+				return
+			}
+			auth, err := s.ensureCodexAuth(r.Context(), channel.ID)
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+				return
+			}
+			channel.CodexAuth = auth
+			models, err := s.fetchUpstreamModels(channel)
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"models": models})
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "channel not found"})
 		return
 	}
 	req.BaseURL = strings.TrimSpace(req.BaseURL)
@@ -1373,9 +1435,9 @@ func (s *Server) validateCodexPAT(ctx context.Context, accessToken string) (*con
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", codexDefaultUA)
+	req.Header.Set("User-Agent", s.codexDefaultUserAgent())
 	req.Header.Set("Originator", "codex-tui")
-	req.Header.Set("Version", codexDefaultVersion)
+	req.Header.Set("Version", s.codexDefaultVersion())
 	resp, err := s.engine.ProxyClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("validate Codex Personal Access Token: %w", err)
@@ -1430,7 +1492,7 @@ func upstreamTarget(ch config.Channel, path string) string {
 	return base + "/responses"
 }
 
-func applyCodexRequestHeaders(dst, src http.Header, auth *config.CodexAuth, stream bool) {
+func (s *Server) applyCodexRequestHeaders(dst, src http.Header, auth *config.CodexAuth, stream bool) {
 	if dst == nil || auth == nil {
 		return
 	}
@@ -1450,20 +1512,20 @@ func applyCodexRequestHeaders(dst, src http.Header, auth *config.CodexAuth, stre
 	}
 	userAgent := strings.TrimSpace(src.Get("User-Agent"))
 	if userAgent == "" {
-		userAgent = codexDefaultUA
+		userAgent = s.codexDefaultUserAgent()
+	} else {
+		userAgent = codexUserAgentWithResolvedVersion(userAgent, s.codexDefaultVersion(), s.codexDefaultUserAgent())
 	}
 	originator := strings.TrimSpace(src.Get("Originator"))
 	if originator == "" {
 		originator = codexOriginatorFromUA(userAgent)
 	}
-	version := strings.TrimSpace(src.Get("Version"))
-	if version == "" {
-		version = codexVersionFromUA(userAgent)
-	}
 	dst.Set("Authorization", "Bearer "+auth.AccessToken)
 	dst.Set("User-Agent", userAgent)
 	dst.Set("Originator", originator)
-	dst.Set("Version", version)
+	// The upstream version declaration must match the resolver used by model
+	// discovery, even when the client sent an older version header.
+	dst.Set("Version", s.codexDefaultVersion())
 	dst.Del("OpenAI-Beta")
 	if auth.AccountID != "" {
 		dst.Set("ChatGPT-Account-ID", auth.AccountID)
@@ -1483,16 +1545,25 @@ func codexOriginatorFromUA(userAgent string) string {
 	return "codex-tui"
 }
 
-func codexVersionFromUA(userAgent string) string {
-	parts := strings.SplitN(strings.TrimSpace(userAgent), "/", 2)
-	if len(parts) != 2 {
-		return codexDefaultVersion
+// codexUserAgentWithResolvedVersion keeps a recognized Codex client identity
+// (and its platform suffix) while replacing the version token, and falls back
+// to the default agent for clients that are not Codex at all.
+func codexUserAgentWithResolvedVersion(userAgent, version, fallback string) string {
+	userAgent = strings.TrimSpace(userAgent)
+	firstTokenEnd := strings.IndexAny(userAgent, " \t")
+	if firstTokenEnd < 0 {
+		firstTokenEnd = len(userAgent)
 	}
-	version := strings.Fields(parts[1])
-	if len(version) == 0 || strings.TrimSpace(version[0]) == "" {
-		return codexDefaultVersion
+	firstToken := userAgent[:firstTokenEnd]
+	slash := strings.LastIndexByte(firstToken, '/')
+	if slash <= 0 {
+		return fallback
 	}
-	return version[0]
+	client := firstToken[:slash]
+	if !strings.HasPrefix(strings.ToLower(client), "codex") {
+		return fallback
+	}
+	return client + "/" + version + userAgent[firstTokenEnd:]
 }
 
 func (s *Server) ensureCodexAuth(ctx context.Context, channelID string) (*config.CodexAuth, error) {
@@ -1792,7 +1863,7 @@ func (s *Server) requestCodexToken(ctx context.Context, form url.Values) (*confi
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", codexDefaultUA)
+	req.Header.Set("User-Agent", s.codexDefaultUserAgent())
 	req.Header.Set("Originator", "codex-tui")
 
 	resp, err := s.engine.ProxyClient().Do(req)
@@ -1842,6 +1913,49 @@ func (s *Server) requestCodexToken(ctx context.Context, form url.Values) (*confi
 }
 
 func (s *Server) fetchUpstreamModels(channel config.Channel) ([]string, error) {
+	if channel.IsCodexAuth() {
+		if channel.CodexAuth == nil {
+			return nil, errors.New("Codex channel authorization is missing")
+		}
+		auth := *channel.CodexAuth
+		auth.Normalize()
+		if strings.TrimSpace(auth.AccessToken) == "" {
+			return nil, errors.New("Codex access_token is missing")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		version := s.codexDefaultVersion()
+		target := config.CodexModelsURL + "?client_version=" + url.QueryEscape(version)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+strings.TrimPrefix(auth.AccessToken, "Bearer "))
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "codex_cli_rs/"+version)
+		req.Header.Set("Originator", "codex_cli_rs")
+		req.Header.Set("Version", version)
+		if auth.AccountID != "" {
+			req.Header.Set("ChatGPT-Account-ID", auth.AccountID)
+		}
+		resp, err := s.engine.ProxyClient().Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("fetch Codex models: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("fetch Codex models returned status %d", resp.StatusCode)
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		if err != nil {
+			return nil, fmt.Errorf("read Codex model list: %w", err)
+		}
+		models := parseCodexModelList(body)
+		if len(models) == 0 {
+			return nil, errors.New("Codex returned an empty model list")
+		}
+		return models, nil
+	}
 	paths := []string{"/v1/models", "/models"}
 	var lastErr error
 	for _, path := range paths {
@@ -1884,6 +1998,29 @@ func (s *Server) fetchUpstreamModels(channel config.Channel) ([]string, error) {
 		return nil, lastErr
 	}
 	return nil, errors.New("unable to fetch models")
+}
+
+func parseCodexModelList(body []byte) []string {
+	var raw struct {
+		Models []struct {
+			Slug string `json:"slug"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(raw.Models))
+	out := make([]string, 0, len(raw.Models))
+	for _, model := range raw.Models {
+		slug := strings.TrimSpace(model.Slug)
+		if slug == "" || seen[slug] {
+			continue
+		}
+		seen[slug] = true
+		out = append(out, slug)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func parseModelList(body []byte) []string {

@@ -8,6 +8,7 @@ const els = {};
 let baseUrl = "http://127.0.0.1:8787";
 let config = { channels: [], model_mappings: [], health_check: {}, listen_addr: "127.0.0.1:8787" };
 let channelsState = [];
+let codexClientVersion = "";
 let tokens = [];
 let modalType = null;
 let modalId = null;
@@ -152,7 +153,7 @@ function channelRowHtml(entry, stateMap) {
   return `
     <tr>
       <td class="channel-status-cell">${channelStatusHtml(st, label)}</td>
-      <td>${esc(ch.name || ch.id)}<div class="sub">${esc(ch.id || "")}</div></td>
+      <td>${esc(ch.name || ch.id)}<div class="sub">${esc(ch.id || "")}</div>${cooldownReasonHtml(st)}</td>
       <td class="mono">${esc(ch.base_url)}</td>
       <td>${ch.priority ?? 0}</td>
       <td>${esc(ch.group || "default")}</td>
@@ -200,8 +201,9 @@ function cooldownProgressHtml(st) {
   const circumference = 2 * Math.PI * 7;
   const offset = circumference * (1 - fraction);
   const label = formatCooldownRemaining(remaining);
+  const title = cooldownTitle(st, label);
   return `
-    <span class="cooldown-ring" title="${esc(t("channels.cooldownRemaining", { time: label }))}">
+    <span class="cooldown-ring" title="${esc(title)}">
       <svg viewBox="0 0 18 18" aria-hidden="true">
         <g transform="rotate(-90 9 9)">
           <circle class="cooldown-bg" cx="9" cy="9" r="7"></circle>
@@ -212,9 +214,34 @@ function cooldownProgressHtml(st) {
     </span>`;
 }
 
+function cooldownReason(st) {
+  const until = Number(st.cooldown_until) || 0;
+  if (!until || until <= Math.floor(Date.now() / 1000)) return "";
+  return (st.cooldown_reason || "").trim();
+}
+
+function cooldownTitle(st, label) {
+  const remaining = t("channels.cooldownRemaining", { time: label });
+  const reason = cooldownReason(st);
+  return reason ? `${remaining} · ${t("channels.cooldownReason", { reason })}` : remaining;
+}
+
+// A cooling channel explains itself in the list: the reason is truncated by CSS
+// and the full text stays available through the title attribute.
+function cooldownReasonHtml(st) {
+  const reason = cooldownReason(st);
+  if (!reason) return "";
+  return `<div class="sub cooldown-reason" title="${esc(reason)}">${esc(reason)}</div>`;
+}
+
 function channelStatusHtml(st, label) {
   const badge = `<span class="badge ${esc(st.status || "unknown")}">${esc(label)}</span>`;
   return `<span class="channel-status">${badge}${cooldownProgressHtml(st)}</span>`;
+}
+
+function renderAbout() {
+  if (!els.aboutCodexVersion) return;
+  els.aboutCodexVersion.textContent = codexClientVersion || "—";
 }
 
 function renderChannels() {
@@ -737,12 +764,14 @@ async function refresh() {
     channelsState = state.channels || [];
     lanAddrs = state.lan_addrs || [];
     tokens = tokenData.tokens || [];
+    codexClientVersion = state.codex_client_version || "";
 
     renderConnectPanel();
     renderChannels();
     renderMappings();
     renderGroups();
     renderTokens();
+    renderAbout();
     els.lastUpdated.textContent = t("common.updatedAt", { time: new Date().toLocaleTimeString(getLocale()) });
   } catch {
     els.lastUpdated.textContent = t("common.routerUnavailable");
@@ -928,7 +957,7 @@ function channelFormHtml(ch) {
       <div class="field">
         <div class="field-head">
           <span class="field-title">${esc(t("channels.availableModels"))}</span>
-          <button type="button" class="mini" data-action="fetch-models" ${isCodex ? "hidden" : ""}>${esc(t("actions.update"))}</button>
+          <button type="button" class="mini" data-action="fetch-models" ${isCodex && !ch.id ? "hidden" : ""}>${esc(t("actions.update"))}</button>
         </div>
         <textarea name="models" rows="4" placeholder="${isCodex ? "*" : "deepseek-chat"}">${esc((ch.models || (isCodex ? ["*"] : [])).join("\n"))}</textarea>
         <small class="field-hint" data-models-hint>${esc(t(isCodex ? "channels.codexModelsHint" : "channels.modelsHint"))}</small>
@@ -1037,7 +1066,8 @@ function syncChannelAuthPanels() {
     panel.hidden = panel.dataset.authPanel !== authMethod;
   });
   const fetchButton = els.modalBody.querySelector('[data-action="fetch-models"]');
-  if (fetchButton) fetchButton.hidden = isCodex;
+  const savedCodex = modalId >= 0 && config.channels?.[modalId]?.auth_type === "codex";
+  if (fetchButton) fetchButton.hidden = isCodex && !savedCodex;
   const hint = els.modalBody.querySelector("[data-models-hint]");
   if (hint) hint.textContent = t(isCodex ? "channels.codexModelsHint" : "channels.modelsHint");
   const baseField = els.modalBody.querySelector('[name="base_url"]');
@@ -1184,6 +1214,29 @@ function collectMappingForm() {
 async function fetchModelsFromForm() {
   const authMethod = els.modalBody.querySelector('[name="auth_method"]')?.value || "api_key";
   if (authMethod.startsWith("codex_")) {
+    const channel = modalId >= 0 ? config.channels?.[modalId] : null;
+    if (!channel?.id || channel.auth_type !== "codex") {
+      toast(t("channels.saveBeforeFetchModels"));
+      return;
+    }
+    toast(t("channels.fetchingModels"));
+    try {
+      const res = await fetch(`${baseUrl}/api/probe_models`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel_id: channel.id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(t("channels.fetchFailed", { error: data.error || res.status }));
+        return;
+      }
+      const modelsField = els.modalBody.querySelector('[name="models"]');
+      modelsField.value = (data.models || []).join("\n");
+      toast(t("channels.fetchSuccess", { count: (data.models || []).length }));
+    } catch {
+      toast(t("channels.fetchError"));
+    }
     return;
   }
   const base = (els.modalBody.querySelector('[name="base_url"]')?.value || "").trim();
@@ -1594,6 +1647,7 @@ window.addEventListener("DOMContentLoaded", () => {
   els.terminalTitle = document.querySelector("#terminal-title");
   els.terminalOutput = document.querySelector("#terminal-output");
   els.terminalClose = document.querySelector("#terminal-close");
+  els.aboutCodexVersion = document.querySelector("#about-codex-version");
 
   els.localeSelect.value = getLocale();
   applyTranslations();

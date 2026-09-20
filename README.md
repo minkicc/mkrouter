@@ -24,7 +24,7 @@ Enable LAN access and let a small team share one self-hosted AI relay on a trust
 
 - Graphical management for channels, groups, priorities, model mappings, and access tokens
 - Channels support no auth, Bearer/custom-header/query API keys, and Codex browser OAuth, `auth.json` / AT, RT, and PAT credentials
-- Codex OAuth credentials support automatic rotation and manual refresh, with account and expiry status shown in channel management
+- Codex OAuth credentials support automatic rotation, manual refresh, and account-scoped model discovery, with account and expiry status shown in channel management
 - Cost-aware channel ordering with configurable price, priority, groups, and weights
 - Channel health checks, retries, cooldowns, and automatic failover
 - Independent channel entries for accounts or tokens with different quotas and limits
@@ -107,6 +107,10 @@ When adding or editing a channel, the following authorization methods are availa
 - **Codex auth.json / Access Token**: import either a complete JSON document or a raw AT.
 - **Codex Refresh Token**: exchange and validate before save, then maintain rotated credentials automatically.
 - **Codex PAT**: validate an `at-` Personal Access Token and load its account identity; PAT credentials are not refreshable.
+
+Every Codex channel shares a single client version. At startup MKRouter synchronizes the latest stable release from the official Codex release feed and uses it for model discovery, health checks, and inference, so the upstream never rejects a request for advertising a stale version. A failed synchronization keeps the last working version. Pin a version with `codex_client_version` in `config.json` (for example `0.155.1`), or set `codex_version_auto_sync` to `false` to disable synchronization.
+
+While a channel is cooling down, the Channels tab shows its countdown together with the reason it was taken out of rotation, such as an upstream status code or connection error. The reason clears after the window expires and a request succeeds.
 
 ## Development
 

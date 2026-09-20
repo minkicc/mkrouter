@@ -540,6 +540,13 @@ tr:last-child td { border-bottom: 0; }
   font-variant-numeric: tabular-nums;
   color: var(--muted, #667085);
 }
+.cooldown-reason {
+  max-width: 168px;
+  overflow: hidden;
+  color: #b26a00;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .muted { color: var(--muted); }
 .hint { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
 .workspace-card > .hint { margin: 0; padding: 11px 16px; border-top: 1px solid var(--border); background: var(--surface-subtle); }
@@ -825,6 +832,7 @@ tr:last-child td { border-bottom: 0; }
   .badge.unknown, .badge.disabled { color: #b1b8c3; background: #2b2f37; }
   .badge.unhealthy { color: #ff8f89; background: #402326; }
   .cooldown-fg { stroke: #f0a34a; }
+  .cooldown-reason { color: #f0a34a; }
   .modal-body label, .field-head { color: #c4cad3; }
   .icon-btn:hover { background: #2b2f37; }
   * { scrollbar-color: #59616d transparent; }

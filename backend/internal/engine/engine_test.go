@@ -340,11 +340,19 @@ func TestCodexHealthProbeUsesSharedAuthorizationResolver(t *testing.T) {
 		}, nil
 	})
 	eng.healthClient.Transport = engineRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.String() != "https://chatgpt.com/backend-api/codex/models" {
+		if req.URL.String() != "https://chatgpt.com/backend-api/codex/models?client_version="+config.CodexClientVersionFallback {
 			t.Fatalf("target = %s", req.URL)
 		}
 		if got := req.Header.Get("Authorization"); got != "Bearer fresh-access" {
 			t.Fatalf("authorization = %q", got)
+		}
+		if got := req.Header.Get("ChatGPT-Account-ID"); got != "account-1" {
+			t.Fatalf("account id = %q", got)
+		}
+		if req.Header.Get("User-Agent") != "codex_cli_rs/"+config.CodexClientVersionFallback ||
+			req.Header.Get("Originator") != "codex_cli_rs" ||
+			req.Header.Get("Version") != config.CodexClientVersionFallback {
+			t.Fatalf("Codex model headers = %v", req.Header)
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,

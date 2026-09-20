@@ -94,6 +94,12 @@ type Config struct {
 	Groups          []Group           `json:"groups,omitempty"`
 	AllowLAN        bool              `json:"allow_lan,omitempty"`
 	UsageMaxRecords int               `json:"usage_max_records,omitempty"`
+	// CodexClientVersion overrides the Codex client version advertised to the
+	// upstream. When empty the synchronized release, then the compiled
+	// fallback, is used instead.
+	CodexClientVersion       string `json:"codex_client_version,omitempty"`
+	CodexClientVersionSynced string `json:"codex_client_version_synced,omitempty"`
+	CodexVersionAutoSync     *bool  `json:"codex_version_auto_sync,omitempty"`
 }
 
 func (c *Config) Clone() *Config {
@@ -277,6 +283,12 @@ func (c *Config) Normalize() {
 	}
 	if c.UsageMaxRecords <= 0 {
 		c.UsageMaxRecords = 500
+	}
+	c.CodexClientVersion = NormalizeCodexClientVersion(c.CodexClientVersion)
+	c.CodexClientVersionSynced = NormalizeCodexClientVersion(c.CodexClientVersionSynced)
+	if c.CodexVersionAutoSync == nil {
+		enabled := true
+		c.CodexVersionAutoSync = &enabled
 	}
 	if c.ModelMappings == nil {
 		c.ModelMappings = []ModelMapping{}

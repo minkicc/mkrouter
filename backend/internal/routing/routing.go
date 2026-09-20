@@ -217,6 +217,116 @@ func IsRetryableError(status int, body []byte) bool {
 	return IsRetryableStatus(status) || ResponseFailed(body)
 }
 
+// ResponseFailureDetail extracts a short human-readable explanation from an
+// upstream failure payload (either a JSON body or an SSE stream) so a channel
+// cooldown can report why it was taken out of rotation instead of a generic
+// message. It returns "" when the payload carries no useful detail.
+func ResponseFailureDetail(body []byte) string {
+	for _, payload := range failurePayloads(body) {
+		if detail := failureDetailFromPayload(payload); detail != "" {
+			return truncateReason(detail, 200)
+		}
+	}
+	return ""
+}
+
+// failurePayloads returns the JSON documents worth inspecting, newest last, so
+// the most recent failure wins over an earlier partial event.
+func failurePayloads(body []byte) [][]byte {
+	body = []byte(strings.TrimSpace(string(body)))
+	if len(body) == 0 {
+		return nil
+	}
+	if !looksLikeSSE(body) {
+		return [][]byte{body}
+	}
+	payloads := make([][]byte, 0, 4)
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		payloads = append(payloads, []byte(payload))
+	}
+	return payloads
+}
+
+func failureDetailFromPayload(data []byte) string {
+	var payload map[string]any
+	if json.Unmarshal(data, &payload) != nil {
+		return ""
+	}
+	// "type" is an error code inside an error object, but only an event name at
+	// the top level, so it counts as a code for the former and never the latter.
+	if detail := failureDetailFromObject(nestedObject(payload, "error"), true); detail != "" {
+		return detail
+	}
+	if detail := failureDetailFromObject(payload, false); detail != "" {
+		return detail
+	}
+	if response, ok := payload["response"].(map[string]any); ok {
+		if detail := failureDetailFromObject(nestedObject(response, "error"), true); detail != "" {
+			return detail
+		}
+		return failureDetailFromObject(response, false)
+	}
+	return ""
+}
+
+func failureDetailFromObject(payload map[string]any, typeIsCode bool) string {
+	if payload == nil {
+		return ""
+	}
+	code := jsonText(payload["code"])
+	if code == "" && typeIsCode {
+		code = jsonText(payload["type"])
+	}
+	message := jsonText(payload["message"])
+	switch {
+	case code != "" && message != "" && code != message:
+		return code + ": " + message
+	case message != "":
+		return message
+	case code != "":
+		return code
+	}
+	if detail := jsonText(payload["detail"]); detail != "" {
+		return detail
+	}
+	if reason := jsonText(nestedObject(payload, "incomplete_details")["reason"]); reason != "" {
+		return "incomplete: " + reason
+	}
+	if status := jsonText(payload["status"]); status == "failed" || status == "incomplete" {
+		return status
+	}
+	return ""
+}
+
+func nestedObject(payload map[string]any, key string) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	value, _ := payload[key].(map[string]any)
+	return value
+}
+
+func jsonText(value any) string {
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func truncateReason(value string, limit int) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) <= limit {
+		return string(runes)
+	}
+	return string(runes[:limit])
+}
+
 func looksLikeSSE(body []byte) bool {
 	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "data:") {

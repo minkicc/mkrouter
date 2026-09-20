@@ -15,6 +15,7 @@ const (
 	ChannelAuthAPIKey = "api_key"
 	ChannelAuthCodex  = "codex"
 	CodexBaseURL      = "https://chatgpt.com/backend-api/codex"
+	CodexModelsURL    = CodexBaseURL + "/models"
 	CodexClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 	APIKeyPlacementBearer        = "bearer"
@@ -68,8 +69,11 @@ func (a *CodexAuth) Normalize() {
 	if a.ClientID == "" {
 		a.ClientID = CodexClientID
 	}
-	a.enrichFromJWT(a.IDToken, false)
-	a.enrichFromJWT(a.AccessToken, true)
+	a.enrichFromJWT(a.IDToken, false, false)
+	// The access token is authoritative for the ChatGPT account used by
+	// Codex. Imported session-shaped JSON can otherwise leave an email or a
+	// stale account value in account_id.
+	a.enrichFromJWT(a.AccessToken, true, true)
 }
 
 func (a *CodexAuth) ExpiresAtTime() (time.Time, bool) {
@@ -175,8 +179,11 @@ func ParseCodexAuthJSON(content string) (*CodexAuth, error) {
 	if auth.AuthMode == CodexAuthModeOAuth || auth.AuthMode == CodexAuthModeAccessToken {
 		auth.AuthMode = CodexAuthModeAuthJSON
 	}
-	if auth.AccessToken == "" && auth.RefreshToken == "" {
-		return nil, errors.New("Codex auth.json is missing access_token and refresh_token")
+	if auth.AccessToken == "" {
+		return nil, errors.New("Codex OAuth JSON is missing access_token; use the Refresh Token authorization method for refresh-token-only credentials")
+	}
+	if clientID := CodexAccessTokenClientID(auth.AccessToken); clientID != "" && clientID != CodexClientID {
+		return nil, fmt.Errorf("access_token belongs to the ChatGPT web client (client_id=%s), not Codex; authorize again with Codex browser OAuth", clientID)
 	}
 	return auth, nil
 }
@@ -189,8 +196,24 @@ func ParseCodexAuthInput(content string) (*CodexAuth, error) {
 	if content == "" {
 		return nil, errors.New("Codex authorization cannot be empty")
 	}
+	if strings.Contains(content, "__Secure-next-auth.session-token=") ||
+		strings.Contains(content, "next-auth.session-token=") {
+		return nil, errors.New("ChatGPT session cookies are not supported for Codex; use Codex browser OAuth")
+	}
 	if strings.HasPrefix(content, "{") {
 		return ParseCodexAuthJSON(content)
+	}
+	if strings.HasPrefix(content, "ac_") || strings.Contains(content, "code=") {
+		return nil, errors.New("Codex OAuth callback URLs and authorization codes must be imported with the browser OAuth method")
+	}
+	if !looksLikeCodexJWT(content) {
+		if strings.HasPrefix(content, "sess-") || strings.Count(content, ".") >= 3 || len(content) > 80 {
+			return nil, errors.New("ChatGPT session tokens are not supported for Codex; use Codex browser OAuth")
+		}
+		return nil, errors.New("Codex Access Token must be a valid OAuth JWT")
+	}
+	if clientID := CodexAccessTokenClientID(content); clientID != "" && clientID != CodexClientID {
+		return nil, fmt.Errorf("access_token belongs to the ChatGPT web client (client_id=%s), not Codex; authorize again with Codex browser OAuth", clientID)
 	}
 	auth := &CodexAuth{
 		AccessToken: content,
@@ -219,10 +242,12 @@ func normalizeCodexAuthMode(value string) string {
 }
 
 type codexJWTClaims struct {
-	Sub        string                `json:"sub"`
-	Email      string                `json:"email"`
-	Exp        int64                 `json:"exp"`
-	OpenAIAuth *codexJWTOpenAIClaims `json:"https://api.openai.com/auth,omitempty"`
+	Sub             string                `json:"sub"`
+	Email           string                `json:"email"`
+	Exp             int64                 `json:"exp"`
+	ClientID        string                `json:"client_id"`
+	AuthorizedParty string                `json:"azp"`
+	OpenAIAuth      *codexJWTOpenAIClaims `json:"https://api.openai.com/auth,omitempty"`
 }
 
 type codexJWTOpenAIClaims struct {
@@ -231,7 +256,7 @@ type codexJWTOpenAIClaims struct {
 	UserID           string `json:"user_id"`
 }
 
-func (a *CodexAuth) enrichFromJWT(token string, includeExpiry bool) {
+func (a *CodexAuth) enrichFromJWT(token string, includeExpiry, authoritativeAccount bool) {
 	claims, err := decodeCodexJWTClaims(token)
 	if err != nil {
 		return
@@ -240,14 +265,19 @@ func (a *CodexAuth) enrichFromJWT(token string, includeExpiry bool) {
 		a.Email = strings.TrimSpace(claims.Email)
 	}
 	if claims.OpenAIAuth != nil {
-		if a.AccountID == "" {
+		if authoritativeAccount && strings.TrimSpace(claims.OpenAIAuth.ChatGPTAccountID) != "" {
+			a.AccountID = strings.TrimSpace(claims.OpenAIAuth.ChatGPTAccountID)
+		} else if a.AccountID == "" {
 			a.AccountID = strings.TrimSpace(claims.OpenAIAuth.ChatGPTAccountID)
 		}
-		if a.UserID == "" {
-			a.UserID = strings.TrimSpace(claims.OpenAIAuth.ChatGPTUserID)
-			if a.UserID == "" {
-				a.UserID = strings.TrimSpace(claims.OpenAIAuth.UserID)
-			}
+		tokenUserID := strings.TrimSpace(claims.OpenAIAuth.ChatGPTUserID)
+		if tokenUserID == "" {
+			tokenUserID = strings.TrimSpace(claims.OpenAIAuth.UserID)
+		}
+		if authoritativeAccount && tokenUserID != "" {
+			a.UserID = tokenUserID
+		} else if a.UserID == "" {
+			a.UserID = tokenUserID
 		}
 	}
 	if a.UserID == "" {
@@ -256,6 +286,25 @@ func (a *CodexAuth) enrichFromJWT(token string, includeExpiry bool) {
 	if includeExpiry && a.ExpiresAt == "" && claims.Exp > 0 {
 		a.ExpiresAt = time.Unix(claims.Exp, 0).UTC().Format(time.RFC3339)
 	}
+}
+
+func CodexAccessTokenClientID(token string) string {
+	claims, err := decodeCodexJWTClaims(token)
+	if err != nil {
+		return ""
+	}
+	if clientID := strings.TrimSpace(claims.ClientID); clientID != "" {
+		return clientID
+	}
+	return strings.TrimSpace(claims.AuthorizedParty)
+}
+
+func looksLikeCodexJWT(token string) bool {
+	claims, err := decodeCodexJWTClaims(token)
+	if err != nil {
+		return false
+	}
+	return claims.Exp > 0 || claims.OpenAIAuth != nil
 }
 
 func decodeCodexJWTClaims(token string) (*codexJWTClaims, error) {

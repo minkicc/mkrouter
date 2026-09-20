@@ -24,7 +24,7 @@ MKRouter 是一个跨平台的本地 AI 请求智能路由桌面应用。Codex �
 
 - 图形化管理渠道、分组、优先级、模型映射和访问 Token
 - 渠道支持免授权、Bearer / 自定义 Header / Query API Key，以及 Codex 浏览器 OAuth、`auth.json` / AT、RT 和 PAT
-- Codex OAuth 凭据支持自动轮换与手动刷新，并在渠道状态中展示账号、过期时间和可刷新状态
+- Codex OAuth 凭据支持自动轮换、手动刷新和按账号发现可用模型，并在渠道状态中展示账号、过期时间和可刷新状态
 - 支持按价格、优先级、分组和权重进行成本导向的渠道排序
 - 支持渠道健康检查、失败重试、冷却和自动切换
 - 可将不同额度或限制的账号 / Token 作为独立渠道管理
@@ -107,6 +107,10 @@ Tauri 提供桌面界面和进程管理，Go 后端提供 OpenAI 兼容代理、
 - **Codex auth.json / Access Token**：支持完整 JSON 或原始 AT。
 - **Codex Refresh Token**：保存前先兑换并校验，之后自动维护轮换令牌。
 - **Codex PAT**：校验 `at-` Personal Access Token 并读取账号信息；PAT 本身不自动刷新。
+
+所有 Codex 渠道共用同一个客户端版本：启动后会自动从 Codex 官方发布记录同步最新稳定版本，并用于模型发现、健康检查和真实推理请求，避免上游因版本过旧而拒绝请求。同步失败时会继续沿用上一次的可用版本，不影响请求转发。需要固定版本时，可在 `config.json` 中设置 `codex_client_version`（如 `0.155.1`）；设置 `codex_version_auto_sync` 为 `false` 可关闭自动同步。
+
+渠道进入冷却时，「渠道」页会显示倒计时和触发原因（例如上游返回的状态码或连接错误），冷却结束并有一次成功请求后自动清除。
 
 ## 本地开发
 

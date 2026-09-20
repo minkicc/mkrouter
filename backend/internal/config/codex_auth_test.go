@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -58,13 +59,9 @@ func TestParseCodexAuthJSONPreservesCredentialRevision(t *testing.T) {
 	}
 }
 
-func TestParseCodexAuthJSONAcceptsRefreshOnly(t *testing.T) {
-	auth, err := ParseCodexAuthJSON(`{"refresh_token":"refresh-only"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if auth.RefreshToken != "refresh-only" {
-		t.Fatalf("refresh token = %q", auth.RefreshToken)
+func TestParseCodexAuthJSONRejectsRefreshOnly(t *testing.T) {
+	if _, err := ParseCodexAuthJSON(`{"refresh_token":"refresh-only"}`); err == nil {
+		t.Fatal("expected refresh-only JSON to require the dedicated authorization method")
 	}
 }
 
@@ -76,9 +73,10 @@ func TestParseCodexAuthJSONRejectsMissingTokens(t *testing.T) {
 
 func TestParseCodexAuthInputAcceptsRawAccessToken(t *testing.T) {
 	token := testCodexJWT(t, map[string]any{
-		"sub":   "user-raw",
-		"email": "raw@example.com",
-		"exp":   time.Now().Add(time.Hour).Unix(),
+		"sub":       "user-raw",
+		"email":     "raw@example.com",
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"client_id": CodexClientID,
 		"https://api.openai.com/auth": map[string]any{
 			"chatgpt_account_id": "account-raw",
 		},
@@ -92,6 +90,49 @@ func TestParseCodexAuthInputAcceptsRawAccessToken(t *testing.T) {
 	}
 	if auth.AccountID != "account-raw" || auth.Email != "raw@example.com" {
 		t.Fatalf("raw JWT claims not enriched: %+v", auth)
+	}
+}
+
+func TestParseCodexAuthInputRejectsChatGPTWebAccessToken(t *testing.T) {
+	token := testCodexJWT(t, map[string]any{
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"client_id": "chatgpt-web-client",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "account-web",
+		},
+	})
+	if _, err := ParseCodexAuthInput(token); err == nil {
+		t.Fatal("expected ChatGPT web access token to be rejected")
+	}
+}
+
+func TestParseCodexAuthInputRejectsSessionCredentialAndOAuthCallback(t *testing.T) {
+	for _, input := range []string{
+		"__Secure-next-auth.session-token=session-value",
+		"sess-" + strings.Repeat("x", 90),
+		"http://localhost:1455/auth/callback?code=ac_code&state=state",
+		"ac_authorization-code",
+	} {
+		if _, err := ParseCodexAuthInput(input); err == nil {
+			t.Fatalf("expected %q to be rejected", input)
+		}
+	}
+}
+
+func TestCodexAccessTokenAccountOverridesImportedAccount(t *testing.T) {
+	token := testCodexJWT(t, map[string]any{
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"client_id": CodexClientID,
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "account-from-token",
+		},
+	})
+	auth, err := ParseCodexAuthJSON(`{"access_token":"` + token + `","account_id":"wrong@example.com"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.AccountID != "account-from-token" {
+		t.Fatalf("account id = %q", auth.AccountID)
 	}
 }
 

@@ -55,6 +55,7 @@ type ChannelState struct {
 	CooldownUntil        int64             `json:"cooldown_until,omitempty"`
 	CooldownCount        int               `json:"cooldown_count,omitempty"`
 	CooldownDuration     int64             `json:"cooldown_duration_seconds,omitempty"`
+	CooldownReason       string            `json:"cooldown_reason,omitempty"`
 }
 
 type Selection struct {
@@ -72,8 +73,13 @@ type healthState struct {
 	lastError            string
 	nextCheck            time.Time
 	cooldownUntil        time.Time
+	cooldownReason       string
 	consecutiveCooldowns int
 }
+
+// cooldownReasonLimit bounds the stored explanation so a chatty upstream error
+// cannot bloat the state payload.
+const cooldownReasonLimit = 512
 
 type channelRuntime struct {
 	channel config.Channel
@@ -112,6 +118,15 @@ func (e *Engine) SetCodexAuthResolver(resolver func(context.Context, string) (*c
 	e.mu.Lock()
 	e.codexAuthResolver = resolver
 	e.mu.Unlock()
+}
+
+// CodexClientVersion is the version advertised to the Codex upstream. Model
+// discovery, health probes, and inference all resolve it here so they can never
+// disagree during a release rollover.
+func (e *Engine) CodexClientVersion() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.cfg.EffectiveCodexClientVersion()
 }
 
 func New(cfg *config.Config) (*Engine, error) {
@@ -319,7 +334,7 @@ func (e *Engine) probe(ch config.Channel, path string, timeoutSeconds int) (int,
 	}
 	target := BuildURL(ch.BaseURL, path)
 	if ch.IsCodexAuth() {
-		target = strings.TrimRight(ch.BaseURL, "/") + "/models"
+		target = config.CodexModelsURL + "?client_version=" + e.CodexClientVersion()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
@@ -335,9 +350,11 @@ func (e *Engine) probe(ch config.Channel, path string, timeoutSeconds int) (int,
 		if auth.AccountID != "" {
 			req.Header.Set("ChatGPT-Account-ID", auth.AccountID)
 		}
-		req.Header.Set("User-Agent", "codex-tui/0.146.0 (Windows 11; x86_64) WindowsTerminal")
-		req.Header.Set("Originator", "codex-tui")
-		req.Header.Set("Version", "0.146.0")
+		req.Header.Set("Accept", "application/json")
+		version := e.CodexClientVersion()
+		req.Header.Set("User-Agent", "codex_cli_rs/"+version)
+		req.Header.Set("Originator", "codex_cli_rs")
+		req.Header.Set("Version", version)
 	}
 	for k, v := range ch.Headers {
 		req.Header.Set(k, v)
@@ -381,6 +398,7 @@ func (e *Engine) recordSuccess(id string, status int, latency time.Duration, fro
 	// successful /v1/models probe must not hide repeated request failures.
 	if fromRequest {
 		rt.health.consecutiveCooldowns = 0
+		rt.health.cooldownReason = ""
 	}
 	threshold := health.SuccessThreshold
 	if threshold <= 0 {
@@ -440,10 +458,18 @@ func (e *Engine) RecordAttempt(id string, status int, err error, latency time.Du
 	}
 }
 
-// Cooldown removes a channel from routing for a short window. It must be
-// called after the channel's retries have been exhausted (or the failure is
-// not worth retrying on the same channel), not on the first failed attempt.
+// Cooldown removes a channel from routing for a short window and explains it
+// with the recorded failure.
 func (e *Engine) Cooldown(id string) {
+	e.CooldownWithReason(id, "")
+}
+
+// CooldownWithReason removes a channel from routing for a short window and
+// keeps the trigger explanation so the channel list can show why it is cooling
+// down and when it will be retried. It must be called after the channel's
+// retries have been exhausted (or the failure is not worth retrying on the same
+// channel), not on the first failed attempt.
+func (e *Engine) CooldownWithReason(id, reason string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if rt, ok := e.runtimes[id]; ok {
@@ -452,7 +478,22 @@ func (e *Engine) Cooldown(id string) {
 		// Cooldown is caused by an exhausted request retry cycle, so the
 		// channel must not continue to advertise a stale healthy status.
 		rt.health.status = StatusUnhealthy
+		rt.health.cooldownReason = normalizeCooldownReason(reason, rt.health.lastError)
 	}
+}
+
+func normalizeCooldownReason(reason, lastError string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = strings.TrimSpace(lastError)
+	}
+	if reason == "" {
+		return "upstream request failed"
+	}
+	if len([]rune(reason)) > cooldownReasonLimit {
+		return string([]rune(reason)[:cooldownReasonLimit])
+	}
+	return reason
 }
 
 // cooldownDuration returns the cooldown window for the nth consecutive
@@ -507,6 +548,7 @@ func (e *Engine) State() []ChannelState {
 			CooldownUntil:        cooldownUntilUnix(rt.health.cooldownUntil),
 			CooldownCount:        rt.health.consecutiveCooldowns,
 			CooldownDuration:     int64(cooldownDuration(rt.health.consecutiveCooldowns) / time.Second),
+			CooldownReason:       activeCooldownReason(rt.health),
 		}
 		st.AuthStatus, st.AuthEmail, st.AuthExpiresAt, st.AuthRefreshable, st.AuthMode = channelAuthorizationState(ch)
 		out = append(out, st)
@@ -623,6 +665,15 @@ func cooldownUntilUnix(t time.Time) int64 {
 		return 0
 	}
 	return t.Unix()
+}
+
+// activeCooldownReason only surfaces the explanation while the channel is
+// actually cooling down, so a stale reason cannot outlive the window.
+func activeCooldownReason(health healthState) string {
+	if health.cooldownUntil.IsZero() || !time.Now().Before(health.cooldownUntil) {
+		return ""
+	}
+	return health.cooldownReason
 }
 
 func routingStatus(status HealthStatus) routing.Status {
